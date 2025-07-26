@@ -1,0 +1,184 @@
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+
+import { createReactAgent } from '@langchain/langgraph/prebuilt';
+
+import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
+
+import { Document } from '@langchain/core/documents';
+
+import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
+
+import { MongoDBAtlasVectorSearch } from "@langchain/mongodb";
+
+import { MongoClient } from "mongodb";
+
+import { tool } from '@langchain/core/tools';
+
+import { z } from 'zod';
+
+import data from './data.js';
+
+
+
+// 1. Prepare and chunk documents
+
+const docs = data.map(video => new Document({ pageContent: video.transcript, metadata: { video_id: video.id, title: video.title } }));
+
+const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 200 });
+
+const chunks = await splitter.splitDocuments(docs);
+
+
+
+// 2. Build embeddings and vector DB
+
+const embeddings = new GoogleGenerativeAIEmbeddings({ model: "text-embedding-004" });
+
+const client = new MongoClient(process.env.MONGODB_ATLAS_URI || "");
+
+await client.connect();
+
+const collection = client.db(process.env.MONGODB_ATLAS_DB_NAME).collection(process.env.MONGODB_ATLAS_COLLECTION_NAME);
+
+const vectorStore = new MongoDBAtlasVectorSearch(embeddings, { collection, indexName: "vector_index" });
+
+await vectorStore.addDocuments(chunks);
+
+console.log('✨ Documents added to vector DB');
+
+
+
+// 3. Define retrieval tool
+
+const retrievalTool = tool(
+
+  async ({ query }) => {
+
+    console.log('🔍 Retrieval for:', query);
+
+    const docs = await vectorStore.similaritySearch(query, 3);
+
+    return docs.map(d => d.pageContent).join('\n---\n');
+
+  },
+
+  { name: 'retrieve', description: 'Search transcripts to answer user questions.', schema: z.object({ query: z.string() }) }
+
+);
+
+
+
+// 4. LLM and agent
+
+const llm = new ChatGoogleGenerativeAI({ model: "gemini-1.5-flash-latest" });
+
+const agent = createReactAgent({ llm, tools: [retrievalTool] });
+
+
+
+// 5. Execution loop
+
+async function runAgent(messages) {
+
+  const { messages: out } = await agent.invoke({ messages });
+
+  const last = out.at(-1);
+
+
+
+  if (last.tool_calls && last.tool_calls.length > 0) {
+
+    const call = last.tool_calls[0];
+
+    console.log('🛠️ Tool:', call.name, call.args);
+
+    const result = await retrievalTool.call(call.args);
+
+    return runAgent([...messages, last, { role: 'tool', name: call.name, content: result }]);
+
+  }
+
+  return last.content;
+
+}
+
+
+
+// 6. Add a system prompt so the agent knows about its tool
+
+const systemMessage = { role: 'system', content: 'You are an AI assistant that can use a tool named "retrieve" to search video transcripts for answers.' };
+
+
+
+(async () => {
+
+  const userQuery = 'What is language of budanian people?';
+
+  const answer = await runAgent([systemMessage, { role: 'user', content: userQuery }]);
+
+  console.log('📝 Final answer:', answer);
+
+})();
+
+//////////////////////////
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { createReactAgent } from '@langchain/langgraph/prebuilt';
+import { tool } from '@langchain/core/tools';
+import { z } from 'zod';
+import { MemorySaver } from '@langchain/langgraph';
+import { vectorStore, addYTVideoToVectorStore } from "./embeddings.js";
+import data from './data.js';
+
+await addYTVideoToVectorStore(data[0]);
+await addYTVideoToVectorStore(data[1]);
+
+const videoid= "video_007";
+// retrieval tool
+const retrievalTool= tool(async ({query},{configurable: {videoid}})=>{
+     console.log('retrieving docs for query');
+     console.log(query);
+     console.log(videoid);
+     const retrievedDocs=await vectorStore.similaritySearch(
+        query,
+        1,
+        (doc)=>doc.metadata.video_id===videoid
+    );
+     //the above gives me 1 docs, and now i put it all in one
+     const serializeDocs=retrievedDocs.map((doc)=>doc.pageContent).join('\n');
+     return serializeDocs;
+},{
+    //its meta data, and llm knows through description what this tool is supposed to do and when to use
+    name: 'retrieve',
+    description: 'Search video transcripts to answer questions.',
+    schema: z.object({
+        query: z.string(),
+    }),
+});
+//zod helps us create schema of how object should look like and tools need schema so that llm knows what input data to send where
+// retrieving the most relevant chunks
+// const retrievedDocs=await vectorStore.similaritySearch("Why my name is Himanshu?",1);
+// console.log("--- Similarity Search Results ---", retrievedDocs);
+
+const llm = new ChatGoogleGenerativeAI({
+    model: "gemini-1.5-flash-latest", 
+});
+
+const checkpointer=new MemorySaver();
+
+const agent=createReactAgent({
+    llm, 
+    tools: [retrievalTool], 
+    checkpointer,
+});
+
+/// testing the agent
+
+const results1= await agent.invoke({
+    messages:[
+        {
+            role: 'user', 
+            content: 'What do you know about chronoc beans? based on video transcripts using retrieval tool'
+        }
+    ],
+}, {configurable: {thread_id: 1, videoid}});
+console.log(results1.messages.at(-1)?.content);
